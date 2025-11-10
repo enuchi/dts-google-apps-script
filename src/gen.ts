@@ -286,7 +286,8 @@ process.stdin.on('end', () => {
 
         // If type doesn't exist, replace with 'any' to avoid TypeScript errors
         // Preserve array notation if present
-        if (!typeExists && typeName !== 'any' && !typeName.match(/^(Boolean|Number|String|any)\W*$/)) {
+        // Note: void is a TypeScript primitive that should be preserved
+        if (!typeExists && typeName !== 'any' && !typeName.match(/^(Boolean|Number|String|void|any)\W*$/)) {
           // Only replace if the base type doesn't exist AND it's not a known type from types.d.ts
           // (We already checked knownTypesFromTypesFile above, so if typeExists is false here,
           //  it means the type truly doesn't exist)
@@ -318,6 +319,7 @@ process.stdin.on('end', () => {
           name = `...${o.name}`;
         }
 
+        // Lowercase primitive types (but not void, which should stay as-is)
         if (typeName.match(/^(Boolean|Number|String)\W*$/)) {
           typeName = typeName.toLowerCase();
         }
