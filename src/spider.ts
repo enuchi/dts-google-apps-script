@@ -8,7 +8,7 @@ import cheerio from 'cheerio';
 import co from 'co';
 import URL from 'url';
 
-const CONCURRENCY = 4;
+const CONCURRENCY = 100;
 const MIN_WAIT = 1 * 1000;
 
 interface INode {
@@ -100,10 +100,12 @@ const getDoc = ($: CheerioStatic) => {
       return $(this).css('display') !== 'none';
     })
     .map(function(this: Cheerio) {
-      if ($(this).is('pre')) {
+      // handle code blocks that may be wrapped (e.g., div > pre > code)
+      const hasPre = $(this).is('pre') || $(this).find('pre').length > 0;
+      if (hasPre) {
+        const preText = $(this).is('pre') ? $(this).text() : $(this).find('pre').first().text();
         // indent code part
-        return `\n${$(this)
-          .text()
+        return `\n${preText
           .split(/\n/)
           .map((line) => `    ${line}`)
           .join('\n')}\n\n`;
@@ -186,26 +188,106 @@ const getMethod = ($: CheerioStatic, cells: Cheerio, typeHref: string | undefine
     return $(this).attr('id') === detailId;
   });
 
+  // Collect advanced parameters up-front for use in the section output
+  const advancedParamsForDoc: string[] = [];
+  methodSection.find('table.function.advancedparam tr:not(:first-child)').each(function(this: Cheerio) {
+    const cells = $(this).find('td');
+    if (cells.length === 3) {
+      const name = cells.eq(0).text().trim();
+      const typeText = cells.eq(1).text().trim();
+      const desc = cells
+        .eq(2)
+        .text()
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (name && typeText && desc) {
+        advancedParamsForDoc.push(`${name} (${typeText}) — ${desc}`);
+      }
+    }
+  });
+
   const detailedDocsLines: string[] = [];
+  let currentSection: 'return' | 'throws' | 'authorization' | 'advanced' | null = null;
   methodSection
     .children('div')
     .children()
     .each(function(this: Cheerio) {
+      if ($(this).is('h4')) {
+        const title = $(this)
+          .text()
+          .trim()
+          .toLowerCase();
+        // close previous section with two blank lines
+        if (currentSection) {
+          detailedDocsLines.push('', '');
+          currentSection = null;
+        }
+        if (title === 'return') {
+          detailedDocsLines.push('Return:');
+          currentSection = 'return';
+        } else if (title === 'throws') {
+          detailedDocsLines.push('Throws:');
+          currentSection = 'throws';
+        } else if (title === 'authorization') {
+          detailedDocsLines.push('Authorization:');
+          currentSection = 'authorization';
+        } else if (title === 'advanced parameters') {
+          // Label as Parameters per example
+          detailedDocsLines.push('Parameters:');
+          currentSection = 'advanced';
+          // Immediately print advanced parameter bullets if already collected
+          if (advancedParamsForDoc.length) {
+            advancedParamsForDoc.forEach((p) => detailedDocsLines.push(`- ${p}`));
+            // two blank lines after the section per formatting requirement
+            detailedDocsLines.push('', '');
+            currentSection = null;
+          }
+        }
+        return; // handled heading
+      }
+
       if ($(this).is('p')) {
-        detailedDocsLines.push($(this).text());
-      } else if ($(this).is('pre')) {
-        // indent code part
-        detailedDocsLines.push(
-          `${$(this)
-            .text()
-            .split(/\n/)
-            .map((line) => `    ${line}`)
-            .join('\n')}`,
-        );
+        const text = $(this)
+          .text()
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (currentSection === 'return' || currentSection === 'throws') {
+          detailedDocsLines.push(`- ${text}`);
+        } else if (currentSection === 'authorization') {
+          // include the descriptive line under Authorization before the bullet list
+          detailedDocsLines.push(text);
+        } else {
+          detailedDocsLines.push(text);
+        }
+      } else if ($(this).is('ul')) {
+        // capture bullet lists such as Authorization scopes
+        $(this)
+          .find('li')
+          .each(function(this: Cheerio) {
+            const itemText = $(this).text().trim();
+            if (itemText) detailedDocsLines.push(`- ${itemText}`);
+          });
       } else {
-        return false;
+        // handle code blocks possibly wrapped in containers (e.g., devsite-code > pre)
+        const hasPre = $(this).is('pre') || $(this).find('pre').length > 0;
+        if (hasPre) {
+          const preText = $(this).is('pre') ? $(this).text() : $(this).find('pre').first().text();
+          // indent code part
+          detailedDocsLines.push(
+            preText
+              .split(/\n/)
+              .map((line) => `    ${line}`)
+              .join('\n'),
+          );
+        } // ignore other element types and continue scanning
       }
     });
+
+  // ensure two blank lines after a trailing open section
+  if (currentSection) {
+    detailedDocsLines.push('', '');
+    currentSection = null;
+  }
 
   if (detailedDocsLines.length) method.docDetailed = detailedDocsLines.join('\n');
 
@@ -222,6 +304,16 @@ const getMethod = ($: CheerioStatic, cells: Cheerio, typeHref: string | undefine
       method.params.push(createProperty($, paramCells, paramTypeHref));
     }
   });
+
+  // Append Advanced parameters summary into the options parameter doc as well
+  if (advancedParamsForDoc.length) {
+    const summary = `Advanced parameters: ${advancedParamsForDoc.join('; ')}`;
+    const optionsParam = method.params.find((p) => p.name.trim() === 'options');
+    if (optionsParam) {
+      const baseDoc = optionsParam.doc ? optionsParam.doc.replace(/\s+/g, ' ').trim() : '';
+      optionsParam.doc = baseDoc ? `${baseDoc} ${summary}` : summary;
+    }
+  }
   return method;
 };
 
@@ -272,9 +364,18 @@ function visit(url: string) {
       // transformResponse: (data, headers) => {
       //   return data;
       // }
+      // Treat all HTTP statuses as resolved; we'll handle errors explicitly
+      validateStatus: () => true,
+      headers: {
+        'User-Agent': 'dts-google-apps-script-bot/1.0 (+https://github.com/motemen/dts-google-apps-script)',
+      },
     };
 
     return axios(config).then((response: AxiosResponse<string>) => {
+      if (response.status >= 400) {
+        console.error(`SKIP ${response.status} ${url}`);
+        return;
+      }
       const $ = cheerio.load(response.data);
 
       let matchHeading: RegExpMatchArray | null = matchClassEnumInterfaceHeading($);
@@ -332,7 +433,7 @@ co(function*(): any {
       // find nearest parent expandable wrapper section
       // some expandable sections are deeply nested so this finds the deepest level
       const wrapper = $(this).closest('ul.devsite-nav-section');
-      
+
       if (wrapper) {
         googleServiceBlocks.push(wrapper);
       }
@@ -345,7 +446,10 @@ co(function*(): any {
       $(wrapper)
         .find('li')
         .each(function(this: Cheerio) {
-          const name = $(this).text().replace(/(\r\n|\n|\r)/gm, "").trim();
+          const name = $(this)
+            .text()
+            .replace(/(\r\n|\n|\r)/gm, '')
+            .trim();
 
           if (name === 'Overview') {
             inServices = true;
